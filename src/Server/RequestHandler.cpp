@@ -167,12 +167,25 @@ void RequestHandler::getRequestHandler(int client_fd, FileIndexer& indexer, std:
 
 void RequestHandler::postRequestHandler(int clientSocket, const std::string& request) {
     std::cout << "Handling POST request.\n";
+    std::cout << "Total request size: " << request.size() << " bytes\n";
+
+    // Check Content-Length header
+    size_t contentLengthPos = request.find("Content-Length: ");
+    if (contentLengthPos != std::string::npos) {
+        size_t lengthStart = contentLengthPos + 16; // Length of "Content-Length: "
+        size_t lengthEnd = request.find("\r\n", lengthStart);
+        std::string lengthStr = request.substr(lengthStart, lengthEnd - lengthStart);
+        long expectedLength = std::stol(lengthStr);
+        std::cout << "Expected Content-Length: " << expectedLength << " bytes\n";
+    }
 
     // Find boundary from Content-Type
     std::string boundaryPrefix = "boundary=";
     size_t boundaryPos = request.find(boundaryPrefix);
     if (boundaryPos == std::string::npos) {
         std::cerr << "Boundary not found.\n";
+        std::string response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nBoundary not found in Content-Type\n";
+        send(clientSocket, response.c_str(), response.size(), 0);
         return;
     }
 
@@ -183,17 +196,33 @@ void RequestHandler::postRequestHandler(int clientSocket, const std::string& req
         boundaryValue = boundaryValue.substr(0, boundaryEnd);
     }
     std::string boundary = "--" + boundaryValue;
-    std::cout << "🔍 Boundary: [" << boundary << "]\n";
+    std::cout << "Boundary: [" << boundary << "]\n";
     
     size_t endOfHeaders = request.find("\r\n\r\n");
     if (endOfHeaders == std::string::npos) {
         std::cerr << "End of headers not found.\n";
+        std::string response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nMalformed request headers\n";
+        send(clientSocket, response.c_str(), response.size(), 0);
         return;
     }
 
     std::string body = request.substr(endOfHeaders + 4);
-    std::cout << "Body content:\n[" << body << "]\n";
-    std::cout << "Body length: " << body.length() << "\n";
+    std::cout << "Body length: " << body.length() << " bytes\n";
+    
+    // Don't print the entire body for large files, just show a preview
+    if (body.length() > 200) {
+        std::cout << "Body preview (first 100 chars): [" << body.substr(0, 100) << "...]\n";
+        std::cout << "Body preview (last 100 chars): [..." << body.substr(body.length() - 100) << "]\n";
+    } else {
+        std::cout << "Body content: [" << body << "]\n";
+    }
+    
+    if (body.empty()) {
+        std::cerr << "Empty request body received. This might be due to incomplete request transmission.\n";
+        std::string response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nEmpty request body. Make sure the file exists and is readable.\n";
+        send(clientSocket, response.c_str(), response.size(), 0);
+        return;
+    }
     
     // Check if this is a file upload with filename
     size_t fileStart = body.find("filename=");
@@ -237,8 +266,29 @@ void RequestHandler::postRequestHandler(int clientSocket, const std::string& req
             folder = "disk/TEXT/";
         else if (filename.find(".html") != std::string::npos)
             folder = "disk/HTML/";
+        else if (filename.find(".mp4") != std::string::npos || 
+                 filename.find(".avi") != std::string::npos || 
+                 filename.find(".mov") != std::string::npos || 
+                 filename.find(".mkv") != std::string::npos || 
+                 filename.find(".wmv") != std::string::npos || 
+                 filename.find(".flv") != std::string::npos || 
+                 filename.find(".webm") != std::string::npos || 
+                 filename.find(".m4v") != std::string::npos)
+            folder = "disk/VIDEOS/";
+        else if (filename.find("big_buck_bunny") != std::string::npos || 
+                 filename.find("video") != std::string::npos ||
+                 filename.find("movie") != std::string::npos) {
+            // Handle video files without extensions
+            folder = "disk/VIDEOS/";
+            filename = filename + ".mp4"; // Add mp4 extension
+            std::cout << "📹 Detected video file without extension, adding .mp4: " << filename << "\n";
+        }
         else {
             std::cerr << "Unsupported file type: " << filename << "\n";
+            std::cout << "Supported formats: .txt, .html, .mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v\n";
+            std::cout << "Or files containing 'big_buck_bunny', 'video', 'movie' (will be treated as MP4)\n";
+            std::string response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\r\nUnsupported file type. Supported: .txt, .html, .mp4, .avi, .mov, .mkv, .wmv, .flv, .webm, .m4v\nOr files containing 'big_buck_bunny', 'video', 'movie'\n";
+            send(clientSocket, response.c_str(), response.size(), 0);
             return;
         }
     } else {
@@ -271,8 +321,16 @@ void RequestHandler::postRequestHandler(int clientSocket, const std::string& req
                 }
                 
                 // Generate a default filename based on content type or field name
-                filename = fieldName + "_" + std::to_string(time(nullptr)) + ".txt";
-                folder = "disk/TEXT/";
+                if (fieldName == "video" || fieldName == "videofile") {
+                    filename = fieldName + "_" + std::to_string(time(nullptr)) + ".mp4";
+                    folder = "disk/VIDEOS/";
+                } else if (fieldName == "html" || fieldName == "webpage") {
+                    filename = fieldName + "_" + std::to_string(time(nullptr)) + ".html";
+                    folder = "disk/HTML/";
+                } else {
+                    filename = fieldName + "_" + std::to_string(time(nullptr)) + ".txt";
+                    folder = "disk/TEXT/";
+                }
             }
         } else {
             // Fallback: treat entire body as text content
@@ -291,7 +349,19 @@ void RequestHandler::postRequestHandler(int clientSocket, const std::string& req
     }
 
     std::string fullPath = folder + filename;
-    std::ofstream outFile(fullPath);
+    
+    // Determine if this is a binary file (video files should be written in binary mode)
+    bool isBinary = (folder == "disk/VIDEOS/");
+    
+    std::ofstream outFile;
+    if (isBinary) {
+        outFile.open(fullPath, std::ios::binary);
+        std::cout << "Opening video file in binary mode: " << fullPath << "\n";
+    } else {
+        outFile.open(fullPath);
+        std::cout << "Opening text file: " << fullPath << "\n";
+    }
+    
     if (!outFile) {
         std::cerr << "Failed to open file for writing: " << fullPath << "\n";
         std::string response = "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nFailed to save file\n";
@@ -303,7 +373,10 @@ void RequestHandler::postRequestHandler(int clientSocket, const std::string& req
     outFile.close();
 
     std::cout << "File saved: " << fullPath << "\n";
-    std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nFile uploaded to " + folder + " as " + filename + "\n";
+    std::cout << "File size: " << fileContent.size() << " bytes\n";
+    std::cout << "Saved to folder: " << folder << "\n";
+    
+    std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nFile uploaded successfully!\nFilename: " + filename + "\nLocation: " + folder + "\nSize: " + std::to_string(fileContent.size()) + " bytes\n";
     send(clientSocket, response.c_str(), response.size(), 0);
 }
 
