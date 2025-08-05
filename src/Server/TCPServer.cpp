@@ -92,6 +92,8 @@ void TCPServer::start(int port_) {
             requestHandler.handleClientRequest(client_socket, request, indexer);
         } else {
             std::cout << "No data received from client\n";
+        } else {
+            std::cout << "No data received from client\n";
         }
 
         close(client_socket);
